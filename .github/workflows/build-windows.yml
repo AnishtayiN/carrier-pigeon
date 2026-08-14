@@ -1,5 +1,8 @@
 name: Build Windows EXE
 
+permissions:
+  contents: write
+
 on:
   push:
     branches: [ main ]
