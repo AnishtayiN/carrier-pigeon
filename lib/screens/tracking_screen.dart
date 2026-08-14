@@ -65,7 +65,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
                 // Route line
                 PolylineLayer(
                   polylines: [
-                    Polyline(
+                    Polyline<Object>(
                       points: [senderPos, pigeonPos, receiverPos],
                       color: AppColors.mapRoute,
                       strokeWidth: 3,
