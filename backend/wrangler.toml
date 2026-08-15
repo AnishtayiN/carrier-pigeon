@@ -1,8 +1,7 @@
 name = "carrier-pigeon"
-main = "src/index.ts"
+main = "worker.js"
 compatibility_date = "2024-01-01"
 
-# Durable Objects
 [durable_objects]
 bindings = [
   { name = "MESSENGER", class_name = "MessengerDO" }
