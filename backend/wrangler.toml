@@ -6,7 +6,3 @@ compatibility_date = "2024-01-01"
 bindings = [
   { name = "MESSENGER", class_name = "MessengerDO" }
 ]
-
-[[migrations]]
-tag = "v5"
-new_sqlite_classes = ["MessengerDO"]
