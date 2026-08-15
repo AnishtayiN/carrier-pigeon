@@ -2,18 +2,11 @@ name = "carrier-pigeon"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-# Durable Object
 [durable_objects]
 bindings = [
   { name = "MESSENGER", class_name = "MessengerDO" }
 ]
 
 [[migrations]]
-tag = "v4"
+tag = "v5"
 new_sqlite_classes = ["MessengerDO"]
-
-# D1 Database
-[[d1_databases]]
-binding = "DB"
-database_name = "carrier-pigeon-db"
-database_id = "c93f86de-48cb-4e80-831c-e14182a8e25d"
