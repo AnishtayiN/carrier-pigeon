@@ -13,7 +13,17 @@ class WebSocketService {
 
   WebSocketChannel? _channel;
   bool _connected = false;
+  bool _connecting = false;
   String? _userId;
+  Timer? _pingTimer;
+  Timer? _reconnectTimer;
+
+  // Store connect params for reconnect
+  String _name = '';
+  String _avatar = '🕊️';
+  double _lat = 0;
+  double _lng = 0;
+  String _city = '';
 
   final _messageController = StreamController<PigeonMessage>.broadcast();
   final _userController = StreamController<List<Contact>>.broadcast();
@@ -34,9 +44,21 @@ class WebSocketService {
     required double lng,
     required String city,
   }) async {
+    // Don't reconnect if already connecting
+    if (_connecting) return;
+
     _userId = userId;
+    _name = name;
+    _avatar = avatar;
+    _lat = lat;
+    _lng = lng;
+    _city = city;
+    _connecting = true;
 
     try {
+      // Close old connection first
+      _channel?.sink.close();
+
       _channel = WebSocketChannel.connect(Uri.parse(wsUrl));
 
       _channel!.stream.listen(
@@ -50,25 +72,25 @@ class WebSocketService {
         },
         onDone: () {
           _connected = false;
+          _connecting = false;
+          _stopPing();
           _statusController.add(false);
-          // Reconnect after 3 seconds
-          Future.delayed(const Duration(seconds: 3), () {
-            if (_userId != null) connect(
-              userId: userId, name: name, avatar: avatar,
-              lat: lat, lng: lng, city: city,
-            );
-          });
+          _scheduleReconnect();
         },
         onError: (e) {
           print('❌ WS Error: $e');
           _connected = false;
+          _connecting = false;
+          _stopPing();
           _statusController.add(false);
+          _scheduleReconnect();
         },
       );
 
-      // Wait for connection
+      // Wait for connection to establish
       await Future.delayed(const Duration(milliseconds: 500));
       _connected = true;
+      _connecting = false;
       _statusController.add(true);
 
       // Register user
@@ -83,11 +105,44 @@ class WebSocketService {
           'city': city,
         },
       });
+
+      // Start ping keepalive (every 15 seconds)
+      _startPing();
     } catch (e) {
       print('❌ WS Connect Error: $e');
       _connected = false;
+      _connecting = false;
       _statusController.add(false);
+      _scheduleReconnect();
     }
+  }
+
+  void _startPing() {
+    _stopPing();
+    _pingTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      _send({'type': 'ping'});
+    });
+  }
+
+  void _stopPing() {
+    _pingTimer?.cancel();
+    _pingTimer = null;
+  }
+
+  void _scheduleReconnect() {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(const Duration(seconds: 3), () {
+      if (_userId != null && !_connected && !_connecting) {
+        connect(
+          userId: _userId!,
+          name: _name,
+          avatar: _avatar,
+          lat: _lat,
+          lng: _lng,
+          city: _city,
+        );
+      }
+    });
   }
 
   void sendMessage({
@@ -121,6 +176,9 @@ class WebSocketService {
 
   void _handleMessage(Map<String, dynamic> msg) {
     switch (msg['type']) {
+      case 'connected':
+        // Server confirmed connection
+        break;
       case 'welcome':
         final users = (msg['data']['users'] as List)
             .map((u) => Contact.fromMap(u as Map<String, dynamic>))
@@ -134,22 +192,29 @@ class WebSocketService {
         }
         break;
       case 'new_message':
-        _messageController.add(PigeonMessage.fromMap(msg['data'] as Map<String, dynamic>));
+        _messageController.add(
+            PigeonMessage.fromMap(msg['data'] as Map<String, dynamic>));
         break;
       case 'pigeon_update':
-        _pigeonController.add(PigeonMessage.fromMap(msg['data'] as Map<String, dynamic>));
+        _pigeonController.add(
+            PigeonMessage.fromMap(msg['data'] as Map<String, dynamic>));
         break;
       case 'user_online':
+        // Refresh user list on next welcome
+        break;
       case 'user_offline':
-        // Will trigger user list refresh
         break;
       case 'pong':
+        // Keepalive response
         break;
     }
   }
 
   void disconnect() {
+    _stopPing();
+    _reconnectTimer?.cancel();
     _connected = false;
+    _connecting = false;
     _userId = null;
     _statusController.add(false);
     _channel?.sink.close();
