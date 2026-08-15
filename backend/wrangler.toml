@@ -10,7 +10,7 @@ bindings = [
 
 [[migrations]]
 tag = "v3"
-new_classes = ["MessengerDO"]
+new_sqlite_classes = ["MessengerDO"]
 
 # D1 Database
 [[d1_databases]]
