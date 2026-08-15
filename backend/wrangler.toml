@@ -1,6 +1,6 @@
 name = "bitter-cake-f6bc"
 main = "worker.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2025-01-01"
 
 [durable_objects]
 bindings = [
