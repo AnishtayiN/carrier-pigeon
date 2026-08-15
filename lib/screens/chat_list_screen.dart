@@ -2,8 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:carrier_pigeon/models/contact.dart';
 import 'package:carrier_pigeon/models/message.dart';
 import 'package:carrier_pigeon/screens/chat_screen.dart';
-import 'package:carrier_pigeon/services/storage_service.dart';
+import 'package:carrier_pigeon/services/websocket_service.dart';
 import 'package:carrier_pigeon/utils/constants.dart';
+import 'package:uuid/uuid.dart';
 
 class ChatListScreen extends StatefulWidget {
   const ChatListScreen({super.key});
@@ -13,17 +14,51 @@ class ChatListScreen extends StatefulWidget {
 }
 
 class _ChatListScreenState extends State<ChatListScreen> {
+  final WebSocketService _ws = WebSocketService();
   List<PigeonMessage> _messages = [];
+  List<Contact> _users = [];
+  bool _connected = false;
 
   @override
   void initState() {
     super.initState();
-    _loadMessages();
+    _connectWebSocket();
   }
 
-  void _loadMessages() {
-    setState(() {
-      _messages = StorageService().loadMessages();
+  void _connectWebSocket() {
+    final userId = const Uuid().v4();
+    _ws.connect(
+      userId: userId,
+      name: 'کاربر',
+      avatar: '🕊️',
+      lat: 35.68,
+      lng: 51.38,
+      city: 'تهران',
+    );
+
+    _ws.statusStream.listen((connected) {
+      if (mounted) setState(() => _connected = connected);
+    });
+
+    _ws.userStream.listen((users) {
+      if (mounted) setState(() => _users = users);
+    });
+
+    _ws.messageStream.listen((msg) {
+      if (mounted) {
+        setState(() {
+          _messages.add(msg);
+        });
+      }
+    });
+
+    _ws.pigeonStream.listen((msg) {
+      if (mounted) {
+        setState(() {
+          final idx = _messages.indexWhere((m) => m.id == msg.id);
+          if (idx >= 0) _messages[idx] = msg;
+        });
+      }
     });
   }
 
@@ -38,26 +73,44 @@ class _ChatListScreenState extends State<ChatListScreen> {
             Text('کبوتر پیک'),
           ],
         ),
+        actions: [
+          Icon(
+            _connected ? Icons.wifi : Icons.wifi_off,
+            color: _connected ? Colors.green : Colors.red,
+          ),
+          const SizedBox(width: 8),
+        ],
       ),
       body: Column(
         children: [
-          // Flying pigeons banner
           if (_messages.any((m) => m.status == MessageStatus.inTransit))
             _buildFlyingBanner(),
-          // Contact list
           Expanded(
-            child: ListView.builder(
-              itemCount: Contact.sampleContacts.length,
-              itemBuilder: (context, index) {
-                final contact = Contact.sampleContacts[index];
-                final lastMsg = _messages
-                    .where((m) =>
-                        m.receiverId == contact.id || m.senderId == contact.id)
-                    .toList()
-                  ..sort((a, b) => b.sentAt.compareTo(a.sentAt));
-                return _buildContactTile(contact, lastMsg.isNotEmpty ? lastMsg.first : null);
-              },
-            ),
+            child: _users.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Text('🕊️', style: TextStyle(fontSize: 64)),
+                        const SizedBox(height: 16),
+                        Text(
+                          _connected ? 'در انتظار کاربران...' : 'در حال اتصال...',
+                          style: const TextStyle(fontSize: 16, color: AppColors.textSecondary),
+                        ),
+                      ],
+                    ),
+                  )
+                : ListView.builder(
+                    itemCount: _users.length,
+                    itemBuilder: (context, index) {
+                      final contact = _users[index];
+                      final lastMsg = _messages
+                          .where((m) => m.receiverId == contact.id || m.senderId == contact.id)
+                          .toList()
+                        ..sort((a, b) => b.sentAt.compareTo(a.sentAt));
+                      return _buildContactTile(contact, lastMsg.isNotEmpty ? lastMsg.first : null);
+                    },
+                  ),
           ),
         ],
       ),
@@ -146,7 +199,6 @@ class _ChatListScreenState extends State<ChatListScreen> {
           context,
           MaterialPageRoute(builder: (_) => ChatScreen(contact: contact)),
         );
-        _loadMessages();
       },
     );
   }

@@ -2,17 +2,16 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:carrier_pigeon/models/message.dart';
 import 'package:carrier_pigeon/models/contact.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 class WebSocketService {
   static final WebSocketService _instance = WebSocketService._internal();
   factory WebSocketService() => _instance;
   WebSocketService._internal();
 
-  // 🔧 آدرس ورکر خودت رو اینجا بذار
-  static const String wsUrl = 'wss://carrier-pigeon.YOUR_SUBDOMAIN.workers.dev/ws';
+  static const String wsUrl = 'wss://bitter-cake-f6bc.bahparda.workers.dev/ws';
 
-  // ignore: deprecated_member_use
-  dynamic _socket;
+  WebSocketChannel? _channel;
   bool _connected = false;
   String? _userId;
 
@@ -38,9 +37,37 @@ class WebSocketService {
     _userId = userId;
 
     try {
-      // WebSocket via dart:io or html depending on platform
-      // For now we use a simple HTTP polling fallback
-      // In production, use web_socket_channel package
+      _channel = WebSocketChannel.connect(Uri.parse(wsUrl));
+
+      _channel!.stream.listen(
+        (data) {
+          try {
+            final msg = jsonDecode(data as String) as Map<String, dynamic>;
+            _handleMessage(msg);
+          } catch (e) {
+            print('❌ WS Parse Error: $e');
+          }
+        },
+        onDone: () {
+          _connected = false;
+          _statusController.add(false);
+          // Reconnect after 3 seconds
+          Future.delayed(const Duration(seconds: 3), () {
+            if (_userId != null) connect(
+              userId: userId, name: name, avatar: avatar,
+              lat: lat, lng: lng, city: city,
+            );
+          });
+        },
+        onError: (e) {
+          print('❌ WS Error: $e');
+          _connected = false;
+          _statusController.add(false);
+        },
+      );
+
+      // Wait for connection
+      await Future.delayed(const Duration(milliseconds: 500));
       _connected = true;
       _statusController.add(true);
 
@@ -57,6 +84,7 @@ class WebSocketService {
         },
       });
     } catch (e) {
+      print('❌ WS Connect Error: $e');
       _connected = false;
       _statusController.add(false);
     }
@@ -69,7 +97,6 @@ class WebSocketService {
     _send({
       'type': 'send_message',
       'data': {
-        'senderId': _userId,
         'receiverId': receiverId,
         'content': content,
       },
@@ -79,52 +106,57 @@ class WebSocketService {
   void updateLocation(double lat, double lng) {
     _send({
       'type': 'update_location',
-      'data': {
-        'userId': _userId,
-        'lat': lat,
-        'lng': lng,
-      },
+      'data': {'lat': lat, 'lng': lng},
     });
   }
 
   void _send(Map<String, dynamic> msg) {
-    if (!_connected) return;
+    if (!_connected || _channel == null) return;
     try {
-      // In production: _socket.add(jsonEncode(msg));
-      print('📤 WS Send: ${jsonEncode(msg)}');
+      _channel!.sink.add(jsonEncode(msg));
     } catch (e) {
-      print('❌ WS Error: $e');
+      print('❌ WS Send Error: $e');
     }
   }
 
   void _handleMessage(Map<String, dynamic> msg) {
     switch (msg['type']) {
-      case 'new_message':
-        _messageController.add(PigeonMessage.fromMap(msg['data']));
-        break;
-      case 'pigeon_update':
-        _pigeonController.add(PigeonMessage.fromMap(msg['data']));
-        break;
       case 'welcome':
         final users = (msg['data']['users'] as List)
-            .map((u) => Contact.fromMap(u))
+            .map((u) => Contact.fromMap(u as Map<String, dynamic>))
             .toList();
         _userController.add(users);
+        final messages = (msg['data']['messages'] as List)
+            .map((m) => PigeonMessage.fromMap(m as Map<String, dynamic>))
+            .toList();
+        for (final m in messages) {
+          _messageController.add(m);
+        }
+        break;
+      case 'new_message':
+        _messageController.add(PigeonMessage.fromMap(msg['data'] as Map<String, dynamic>));
+        break;
+      case 'pigeon_update':
+        _pigeonController.add(PigeonMessage.fromMap(msg['data'] as Map<String, dynamic>));
         break;
       case 'user_online':
       case 'user_offline':
-        // Refresh user list
+        // Will trigger user list refresh
+        break;
+      case 'pong':
         break;
     }
   }
 
   void disconnect() {
     _connected = false;
+    _userId = null;
     _statusController.add(false);
-    _socket?.close();
+    _channel?.sink.close();
   }
 
   void dispose() {
+    disconnect();
     _messageController.close();
     _userController.close();
     _pigeonController.close();

@@ -2,8 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:carrier_pigeon/models/contact.dart';
 import 'package:carrier_pigeon/models/message.dart';
 import 'package:carrier_pigeon/screens/tracking_screen.dart';
-import 'package:carrier_pigeon/services/pigeon_service.dart';
-import 'package:carrier_pigeon/services/storage_service.dart';
+import 'package:carrier_pigeon/services/websocket_service.dart';
 import 'package:carrier_pigeon/utils/constants.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -17,76 +16,47 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _controller = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  final WebSocketService _ws = WebSocketService();
   List<PigeonMessage> _messages = [];
   bool _showSendAnimation = false;
 
   @override
   void initState() {
     super.initState();
-    _loadMessages();
-    PigeonService().addListener(_onPigeonUpdate);
+    _listenToMessages();
+  }
+
+  void _listenToMessages() {
+    _ws.pigeonStream.listen((msg) {
+      if (mounted && (msg.receiverId == widget.contact.id || msg.senderId == widget.contact.id)) {
+        setState(() {
+          final idx = _messages.indexWhere((m) => m.id == msg.id);
+          if (idx >= 0) {
+            _messages[idx] = msg;
+          } else {
+            _messages.add(msg);
+          }
+          _messages.sort((a, b) => a.sentAt.compareTo(b.sentAt));
+        });
+      }
+    });
   }
 
   @override
   void dispose() {
-    PigeonService().removeListener(_onPigeonUpdate);
     _controller.dispose();
     _scrollController.dispose();
     super.dispose();
-  }
-
-  void _loadMessages() {
-    final storage = StorageService();
-    final all = storage.loadMessages();
-    setState(() {
-      _messages = all
-          .where((m) =>
-              m.receiverId == widget.contact.id ||
-              m.senderId == widget.contact.id)
-          .toList()
-        ..sort((a, b) => a.sentAt.compareTo(b.sentAt));
-    });
-  }
-
-  void _onPigeonUpdate(PigeonMessage msg) {
-    if (msg.receiverId == widget.contact.id ||
-        msg.senderId == widget.contact.id) {
-      _loadMessages();
-    }
   }
 
   void _sendMessage() {
     final text = _controller.text.trim();
     if (text.isEmpty) return;
 
-    final storage = StorageService();
-    final distance = PigeonService.calculateDistance(
-      storage.myLat, storage.myLng,
-      widget.contact.lat, widget.contact.lng,
-    );
-
-    final msg = PigeonMessage(
-      senderId: 'me',
+    _ws.sendMessage(
       receiverId: widget.contact.id,
       content: text,
-      senderLat: storage.myLat,
-      senderLng: storage.myLng,
-      receiverLat: widget.contact.lat,
-      receiverLng: widget.contact.lng,
-      distanceKm: distance,
     );
-
-    // Start the pigeon!
-    msg.status = MessageStatus.inTransit;
-    _messages.add(msg);
-
-    // Save all messages
-    final allMessages = StorageService().loadMessages();
-    allMessages.add(msg);
-    StorageService().saveMessages(allMessages);
-
-    // Start simulation if not running
-    PigeonService().startSimulation(allMessages);
 
     _controller.clear();
     setState(() => _showSendAnimation = true);
@@ -94,7 +64,6 @@ class _ChatScreenState extends State<ChatScreen> {
       if (mounted) setState(() => _showSendAnimation = false);
     });
 
-    _loadMessages();
     Future.delayed(const Duration(milliseconds: 100), () {
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
@@ -131,7 +100,6 @@ class _ChatScreenState extends State<ChatScreen> {
           IconButton(
             icon: const Icon(Icons.map_outlined),
             onPressed: () {
-              // Find latest in-flight message
               final inFlight = _messages
                   .where((m) => m.status == MessageStatus.inTransit)
                   .toList();
@@ -155,9 +123,7 @@ class _ChatScreenState extends State<ChatScreen> {
         color: const Color(0xFFECE5DD),
         child: Column(
           children: [
-            // Distance info banner
             _buildDistanceBanner(),
-            // Messages
             Expanded(
               child: _messages.isEmpty
                   ? _buildEmptyState()
@@ -169,9 +135,7 @@ class _ChatScreenState extends State<ChatScreen> {
                           _buildMessageBubble(_messages[index]),
                     ),
             ),
-            // Send animation
             if (_showSendAnimation) _buildSendAnimation(),
-            // Input
             _buildInputBar(),
           ],
         ),
@@ -180,12 +144,6 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Widget _buildDistanceBanner() {
-    final distance = PigeonService.calculateDistance(
-      StorageService().myLat, StorageService().myLng,
-      widget.contact.lat, widget.contact.lng,
-    );
-    final time = Duration(minutes: (distance / AppConstants.pigeonSpeedKmh * 60).round());
-
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       color: AppColors.primary.withValues(alpha: 0.05),
@@ -194,13 +152,13 @@ class _ChatScreenState extends State<ChatScreen> {
         children: [
           const Text('📍 ', style: TextStyle(fontSize: 14)),
           Text(
-            '${widget.contact.city} — ${PigeonService.formatDistance(distance)}',
+            widget.contact.city,
             style: const TextStyle(fontSize: 13, color: AppColors.textSecondary),
           ),
           const SizedBox(width: 12),
           const Text('🕊️ ', style: TextStyle(fontSize: 14)),
           Text(
-            ' حدود ${PigeonService.formatDuration(time)}',
+            ' سرعت ۱۷۷ کیلومتر بر ساعت',
             style: const TextStyle(fontSize: 13, color: AppColors.textSecondary),
           ),
         ],
