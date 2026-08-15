@@ -25,11 +25,23 @@ class StorageService {
     return jsonList.map((m) => PigeonMessage.fromMap(m)).toList();
   }
 
+  Future<void> saveMyId(String id) async {
+    await _prefs?.setString('my_id', id);
+  }
+
+  String getMyId() => _prefs?.getString('my_id') ?? '';
+
   Future<void> saveMyName(String name) async {
     await _prefs?.setString('my_name', name);
   }
 
-  String getMyName() => _prefs?.getString('my_name') ?? 'شما';
+  String getMyName() => _prefs?.getString('my_name') ?? 'کاربر';
+
+  Future<void> saveMyCity(String city) async {
+    await _prefs?.setString('my_city', city);
+  }
+
+  String getMyCity() => _prefs?.getString('my_city') ?? 'تهران';
 
   Future<void> saveMyLocation(double lat, double lng) async {
     await _prefs?.setDouble('my_lat', lat);
