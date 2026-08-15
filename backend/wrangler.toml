@@ -9,7 +9,7 @@ bindings = [
 ]
 
 [[migrations]]
-tag = "v3"
+tag = "v4"
 new_sqlite_classes = ["MessengerDO"]
 
 # D1 Database
