@@ -1,12 +1,3 @@
 name = "bitter-cake-f6bc"
 main = "worker.js"
 compatibility_date = "2025-01-01"
-
-[durable_objects]
-bindings = [
-  { name = "MESSENGER", class_name = "MessengerDO" }
-]
-
-[[migrations]]
-tag = "v100"
-new_sqlite_classes = ["MessengerDO"]
