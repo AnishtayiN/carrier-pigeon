@@ -18,7 +18,7 @@ android/key.properties
 *.keystore
 
 # Windows
-windows/flutter/
+windows/flutter/ephemeral/
 windows/CMakeFiles/
 windows/CMakeCache.txt
 windows/Runner/Debug/
