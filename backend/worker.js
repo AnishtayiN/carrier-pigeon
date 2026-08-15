@@ -1,12 +1,14 @@
 // 🕊️ Carrier Pigeon WebSocket Worker
-// Cloudflare Worker + Durable Objects
+// Cloudflare Workers + Durable Objects + Hibernation API
+// ============================================
 
-// ============ Types ============
-// @ts-ignore
-const PIGEON_SPEED = 177;
-const LOST_CHANCE = 0.002;
-const SPEED_VARIANCE = 0.25;
+const PIGEON_SPEED = 177;        // km/h base speed
+const LOST_CHANCE = 0.002;       // 0.2% per tick
+const SPEED_VARIANCE = 0.25;     // ±25%
+const TICK_MS = 2000;            // simulation tick interval
+const MAX_MSG_LEN = 2000;        // max message length
 
+// ============ Haversine ============
 function haversineDistance(lat1, lng1, lat2, lng2) {
   const R = 6371;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
@@ -19,43 +21,54 @@ function haversineDistance(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-function createPigeonMessage(senderId, receiverId, content, senderLat, senderLng, receiverLat, receiverLng) {
-  const distance = haversineDistance(senderLat, senderLng, receiverLat, receiverLng);
-  const speedVariation = 1 - SPEED_VARIANCE + Math.random() * SPEED_VARIANCE * 2;
+// ============ Pigeon Factory ============
+function createPigeonMessage(senderId, receiverId, content, sLat, sLng, rLat, rLng) {
+  const distance = haversineDistance(sLat, sLng, rLat, rLng);
+  const sv = 1 - SPEED_VARIANCE + Math.random() * SPEED_VARIANCE * 2;
   return {
     id: crypto.randomUUID(),
     senderId,
     receiverId,
     content,
-    sentAt: new Date().toISOString(),
+    sentAt: Date.now(),
+    lastUpdateAt: Date.now(),
     deliveredAt: null,
     status: "inTransit",
-    senderLat, senderLng,
-    receiverLat, receiverLng,
-    currentLat: senderLat,
-    currentLng: senderLng,
+    senderLat: sLat, senderLng: sLng,
+    receiverLat: rLat, receiverLng: rLng,
+    currentLat: sLat, currentLng: sLng,
     distanceKm: Math.round(distance * 100) / 100,
-    speedKmh: Math.round(PIGEON_SPEED * speedVariation),
+    speedKmh: Math.round(PIGEON_SPEED * sv),
     progress: 0,
   };
 }
 
+// ============ Pigeon Update (time-based) ============
 function updatePigeon(msg) {
   if (msg.status !== "inTransit") return msg;
-  if (Math.random() < LOST_CHANCE) {
+
+  const now = Date.now();
+  const elapsedSec = (now - (msg.lastUpdateAt || msg.sentAt)) / 1000;
+  msg.lastUpdateAt = now;
+
+  // Lost chance scales with elapsed time
+  if (Math.random() < LOST_CHANCE * (elapsedSec / 2)) {
     msg.status = "lost";
     return msg;
   }
-  const speedVariation = 1 - SPEED_VARIANCE + Math.random() * SPEED_VARIANCE * 2;
-  const effectiveSpeed = msg.speedKmh * speedVariation;
-  const increment = (effectiveSpeed / 3600) * 2 / (msg.distanceKm || 1);
+
+  const sv = 1 - SPEED_VARIANCE + Math.random() * SPEED_VARIANCE * 2;
+  const effectiveSpeed = msg.speedKmh * sv;
+  const increment = (effectiveSpeed / 3600) * elapsedSec / (msg.distanceKm || 1);
   msg.progress = Math.min(1, msg.progress + increment);
+
   msg.currentLat = msg.senderLat + (msg.receiverLat - msg.senderLat) * msg.progress;
   msg.currentLng = msg.senderLng + (msg.receiverLng - msg.senderLng) * msg.progress;
   msg.currentLat += Math.sin(msg.progress * Math.PI) * 0.05;
+
   if (msg.progress >= 1) {
     msg.status = "delivered";
-    msg.deliveredAt = new Date().toISOString();
+    msg.deliveredAt = Date.now();
     msg.currentLat = msg.receiverLat;
     msg.currentLng = msg.receiverLng;
   }
@@ -67,136 +80,228 @@ export class MessengerDO {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.connections = new Map();
-    this.users = new Map();
-    this.messages = [];
-    this.pigeonInterval = null;
 
-    // Restore state from storage
-    this.state.blockConcurrencyWhile(async () => {
-      const stored = await this.state.storage.get("messages");
-      if (stored) this.messages = stored;
-    });
+    // WebSocket Hibernation API: acceptWebSocket is called in fetch()
+    // userId stored via ws.serializeAttachment()
+    // users persisted in Durable Object Storage
+    // messages persisted in Durable Object Storage
+    // Alarm used for pigeon simulation (no setInterval)
   }
 
   async fetch(request) {
     const url = new URL(request.url);
+
+    // ---- WebSocket upgrade ----
     if (url.pathname === "/ws") {
       if (request.headers.get("Upgrade") !== "websocket") {
         return new Response("WebSocket required", { status: 426 });
       }
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      this.state.acceptWebSocket(server);
+      // Accept with Hibernation API — no acceptWebSocket call here,
+      // the userId will be set on first message after register
+      this.ctx.acceptWebSocket(server);
       return new Response(null, { status: 101, webSocket: client });
     }
+
+    // ---- REST endpoints ----
     if (url.pathname === "/messages") {
-      return Response.json(this.messages.slice(-100));
+      const msgs = (await this.state.storage.get("messages")) || [];
+      return Response.json(msgs.slice(-100));
     }
     if (url.pathname === "/users") {
-      return Response.json(Array.from(this.users.values()));
+      const users = (await this.state.storage.get("users")) || {};
+      return Response.json(Object.values(users));
     }
-    return Response.json({ name: "🕊️ Carrier Pigeon", status: "ok" });
+
+    return Response.json({
+      name: "🕊️ Carrier Pigeon API",
+      status: "ok",
+      ws: `wss://${url.host}/ws`,
+    });
   }
 
+  // ---- WebSocket message (Hibernation API) ----
   async webSocketMessage(ws, raw) {
+    let msg;
     try {
-      const msg = JSON.parse(raw);
-      await this.handleMessage(ws, msg);
-    } catch (e) {
-      ws.send(JSON.stringify({ type: "error", data: "Invalid JSON" }));
+      msg = JSON.parse(raw);
+    } catch {
+      return ws.send(JSON.stringify({ type: "error", data: "Invalid JSON" }));
     }
-  }
 
-  async webSocketClose(ws) {
-    for (const [userId, conn] of this.connections) {
-      if (conn === ws) {
-        this.connections.delete(userId);
-        const user = this.users.get(userId);
-        if (user) {
-          user.connected = false;
-          this.broadcast({ type: "user_offline", data: { userId } });
-        }
-        break;
-      }
-    }
-  }
+    const attachment = ws.deserializeAttachment();
+    const userId = attachment?.userId;
 
-  async handleMessage(ws, msg) {
     switch (msg.type) {
       case "register": {
-        const { userId, name, avatar, lat, lng, city } = msg.data;
-        const user = {
-          id: userId, name,
+        const { userId: uid, name, avatar, lat, lng, city } = msg.data || {};
+        if (!uid || !name) {
+          return ws.send(JSON.stringify({ type: "error", data: "userId and name required" }));
+        }
+
+        // Store userId in WebSocket attachment
+        ws.serializeAttachment({ userId: uid });
+
+        // Persist user in storage
+        const users = (await this.state.storage.get("users")) || {};
+        users[uid] = {
+          id: uid, name,
           avatar: avatar || "🕊️",
           lat: lat || 0, lng: lng || 0,
           city: city || "",
           connected: true,
         };
-        this.users.set(userId, user);
-        this.connections.set(userId, ws);
+        await this.state.storage.put("users", users);
+
+        // Send welcome to this user
+        const messages = (await this.state.storage.get("messages")) || [];
         ws.send(JSON.stringify({
           type: "welcome",
-          data: { user, users: Array.from(this.users.values()), messages: this.messages.slice(-50) },
+          data: {
+            user: users[uid],
+            users: Object.values(users),
+            messages: messages.slice(-50),
+          },
         }));
-        this.broadcast({ type: "user_online", data: user }, userId);
+
+        // Broadcast user_online to others
+        this.broadcast({ type: "user_online", data: users[uid] }, uid);
         break;
       }
+
       case "send_message": {
-        const { senderId, receiverId, content } = msg.data;
-        const sender = this.users.get(senderId);
-        const receiver = this.users.get(receiverId);
-        if (!sender || !receiver) return ws.send(JSON.stringify({ type: "error", data: "User not found" }));
-        const pigeonMsg = createPigeonMessage(senderId, receiverId, content, sender.lat, sender.lng, receiver.lat, receiver.lng);
-        this.messages.push(pigeonMsg);
-        this.sendTo(senderId, { type: "new_message", data: pigeonMsg });
-        this.sendTo(receiverId, { type: "new_message", data: pigeonMsg });
-        this.startPigeonSimulation();
+        // Auth: userId must be set from attachment, not from message
+        if (!userId) {
+          return ws.send(JSON.stringify({ type: "error", data: "Not registered" }));
+        }
+
+        const { receiverId, content } = msg.data || {};
+
+        // Validate
+        if (!receiverId || typeof content !== "string" || content.length === 0 || content.length > MAX_MSG_LEN) {
+          return ws.send(JSON.stringify({
+            type: "error",
+            data: `Invalid message (max ${MAX_MSG_LEN} chars)`,
+          }));
+        }
+
+        const users = (await this.state.storage.get("users")) || {};
+        const sender = users[userId];
+        const receiver = users[receiverId];
+
+        if (!sender || !receiver) {
+          return ws.send(JSON.stringify({ type: "error", data: "User not found" }));
+        }
+
+        const pigeonMsg = createPigeonMessage(
+          userId, receiverId, content,
+          sender.lat, sender.lng,
+          receiver.lat, receiver.lng,
+        );
+
         // Persist
-        await this.state.storage.put("messages", this.messages.slice(-200));
+        const messages = (await this.state.storage.get("messages")) || [];
+        messages.push(pigeonMsg);
+        // Keep last 500 messages
+        if (messages.length > 500) messages.splice(0, messages.length - 500);
+        await this.state.storage.put("messages", messages);
+
+        // Notify sender & receiver
+        this.sendTo(userId, { type: "new_message", data: pigeonMsg });
+        this.sendTo(receiverId, { type: "new_message", data: pigeonMsg });
+
+        // Start pigeon simulation via Alarm
+        await this.ensureAlarm();
         break;
       }
+
       case "update_location": {
-        const { userId, lat, lng } = msg.data;
-        const user = this.users.get(userId);
-        if (user) { user.lat = lat; user.lng = lng; }
+        if (!userId) return;
+        const { lat, lng } = msg.data || {};
+        if (typeof lat !== "number" || typeof lng !== "number") return;
+
+        const users = (await this.state.storage.get("users")) || {};
+        if (users[userId]) {
+          users[userId].lat = lat;
+          users[userId].lng = lng;
+          await this.state.storage.put("users", users);
+        }
         break;
       }
-      case "ping":
+
+      case "ping": {
         ws.send(JSON.stringify({ type: "pong" }));
         break;
+      }
+
+      default:
+        ws.send(JSON.stringify({ type: "error", data: "Unknown type" }));
     }
   }
 
-  startPigeonSimulation() {
-    if (this.pigeonInterval) return;
-    this.pigeonInterval = setInterval(() => {
-      let hasFlying = false;
-      for (const msg of this.messages) {
-        if (msg.status === "inTransit") {
-          updatePigeon(msg);
-          hasFlying = true;
-          this.sendTo(msg.senderId, { type: "pigeon_update", data: msg });
-          this.sendTo(msg.receiverId, { type: "pigeon_update", data: msg });
-        }
-      }
-      if (!hasFlying && this.pigeonInterval) {
-        clearInterval(this.pigeonInterval);
-        this.pigeonInterval = null;
-      }
-    }, 2000);
+  // ---- WebSocket close ----
+  async webSocketClose(ws) {
+    const attachment = ws.deserializeAttachment();
+    if (!attachment?.userId) return;
+
+    const users = (await this.state.storage.get("users")) || {};
+    if (users[attachment.userId]) {
+      users[attachment.userId].connected = false;
+      await this.state.storage.put("users", users);
+      this.broadcast({ type: "user_offline", data: { userId: attachment.userId } });
+    }
   }
 
+  // ---- Alarm for pigeon simulation ----
+  async ensureAlarm() {
+    const existing = await this.state.storage.getAlarm();
+    if (!existing) {
+      await this.state.storage.setAlarm(Date.now() + TICK_MS);
+    }
+  }
+
+  async alarm() {
+    const messages = (await this.state.storage.get("messages")) || [];
+    let hasFlying = false;
+
+    for (const msg of messages) {
+      if (msg.status === "inTransit") {
+        updatePigeon(msg);
+        hasFlying = true;
+        this.sendTo(msg.senderId, { type: "pigeon_update", data: msg });
+        this.sendTo(msg.receiverId, { type: "pigeon_update", data: msg });
+      }
+    }
+
+    // Persist updated messages
+    await this.state.storage.put("messages", messages);
+
+    // Schedule next tick if there are still flying pigeons
+    if (hasFlying) {
+      await this.state.storage.setAlarm(Date.now() + TICK_MS);
+    }
+  }
+
+  // ---- Send helpers (use Hibernation API getWebSockets) ----
   broadcast(msg, excludeId) {
     const data = JSON.stringify(msg);
-    for (const [userId, ws] of this.connections) {
-      if (userId !== excludeId) { try { ws.send(data); } catch {} }
+    for (const ws of this.ctx.getWebSockets()) {
+      const attachment = ws.deserializeAttachment();
+      if (attachment?.userId !== excludeId) {
+        try { ws.send(data); } catch {}
+      }
     }
   }
 
-  sendTo(userId, msg) {
-    const ws = this.connections.get(userId);
-    if (ws) { try { ws.send(JSON.stringify(msg)); } catch {} }
+  async sendTo(userId, msg) {
+    const data = JSON.stringify(msg);
+    for (const ws of this.ctx.getWebSockets()) {
+      const attachment = ws.deserializeAttachment();
+      if (attachment?.userId === userId) {
+        try { ws.send(data); } catch {}
+      }
+    }
   }
 }
 
@@ -204,6 +309,8 @@ export class MessengerDO {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    // CORS
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -213,9 +320,15 @@ export default {
         },
       });
     }
+
     if (url.pathname === "/") {
-      return Response.json({ name: "🕊️ Carrier Pigeon API", ws: `wss://${url.host}/ws` });
+      return Response.json({
+        name: "🕊️ Carrier Pigeon API",
+        version: "2.0.0",
+        ws: `wss://${url.host}/ws`,
+      });
     }
+
     const doId = env.MESSENGER.idFromName("main");
     return env.MESSENGER.get(doId).fetch(request);
   },
