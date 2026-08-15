@@ -1,6 +1,5 @@
 // 🕊️ Carrier Pigeon WebSocket Worker v5.1
 // Cloudflare Workers + Durable Objects + Hibernation API
-// Storage: DO KV storage (get/put) - works with both sqlite and non-sqlite DOs
 
 const PIGEON_SPEED = 177;
 const LOST_CHANCE = 0.002;
@@ -22,16 +21,12 @@ function createPigeonMessage(senderId, receiverId, content, sLat, sLng, rLat, rL
   return {
     id: crypto.randomUUID(),
     senderId, receiverId, content,
-    sentAt: Date.now(),
-    lastUpdateAt: Date.now(),
-    deliveredAt: null,
+    sentAt: Date.now(), lastUpdateAt: Date.now(), deliveredAt: null,
     status: "inTransit",
-    senderLat: sLat, senderLng: sLng,
-    receiverLat: rLat, receiverLng: rLng,
+    senderLat: sLat, senderLng: sLng, receiverLat: rLat, receiverLng: rLng,
     currentLat: sLat, currentLng: sLng,
     distanceKm: Math.round(distance * 100) / 100,
-    speedKmh: Math.round(PIGEON_SPEED * sv),
-    progress: 0,
+    speedKmh: Math.round(PIGEON_SPEED * sv), progress: 0,
   };
 }
 
@@ -42,9 +37,8 @@ function updatePigeon(msg) {
   msg.lastUpdateAt = now;
   if (Math.random() < LOST_CHANCE * (elapsedSec / 2)) { msg.status = "lost"; return msg; }
   const sv = 1 - SPEED_VARIANCE + Math.random() * SPEED_VARIANCE * 2;
-  const effectiveSpeed = msg.speedKmh * sv;
-  const increment = (effectiveSpeed / 3600) * elapsedSec / (msg.distanceKm || 1);
-  msg.progress = Math.min(1, msg.progress + increment);
+  const inc = (msg.speedKmh * sv / 3600) * elapsedSec / (msg.distanceKm || 1);
+  msg.progress = Math.min(1, msg.progress + inc);
   msg.currentLat = msg.senderLat + (msg.receiverLat - msg.senderLat) * msg.progress;
   msg.currentLng = msg.senderLng + (msg.receiverLng - msg.senderLng) * msg.progress;
   msg.currentLat += Math.sin(msg.progress * Math.PI) * 0.05;
@@ -60,8 +54,6 @@ export class MessengerDO {
 
   async fetch(request) {
     const url = new URL(request.url);
-
-    // WebSocket upgrade
     if (url.pathname === "/ws") {
       if (request.headers.get("Upgrade") !== "websocket") return new Response("WebSocket required", { status: 426 });
       const pair = new WebSocketPair();
@@ -69,8 +61,6 @@ export class MessengerDO {
       this.ctx.acceptWebSocket(server);
       return new Response(null, { status: 101, webSocket: client });
     }
-
-    // REST endpoints
     if (url.pathname === "/messages") {
       const messages = (await this.state.storage.get("messages")) || [];
       return Response.json(messages.slice(-100));
@@ -79,7 +69,6 @@ export class MessengerDO {
       const users = (await this.state.storage.get("users")) || {};
       return Response.json(Object.values(users));
     }
-
     return Response.json({ name: "🕊️ Carrier Pigeon", version: "5.1.0", ws: `wss://${url.host}/ws` });
   }
 
@@ -89,52 +78,50 @@ export class MessengerDO {
     const att = ws.deserializeAttachment();
     const userId = att?.userId;
 
-    switch (msg.type) {
-      case "register": {
-        const { userId: uid, name, avatar, lat, lng, city } = msg.data || {};
-        if (!uid || !name) return ws.send(JSON.stringify({ type: "error", data: "userId and name required" }));
-        ws.serializeAttachment({ userId: uid });
-        const users = (await this.state.storage.get("users")) || {};
-        users[uid] = { id: uid, name, avatar: avatar || "🕊️", lat: lat || 0, lng: lng || 0, city: city || "", connected: true };
-        await this.state.storage.put("users", users);
-        const messages = (await this.state.storage.get("messages")) || [];
-        ws.send(JSON.stringify({ type: "welcome", data: { user: users[uid], users: Object.values(users), messages: messages.slice(-50) } }));
-        this.broadcast({ type: "user_online", data: users[uid] }, uid);
-        break;
-      }
-
-      case "send_message": {
-        if (!userId) return ws.send(JSON.stringify({ type: "error", data: "Not registered" }));
-        const { receiverId, content } = msg.data || {};
-        if (!receiverId || typeof content !== "string" || !content.length || content.length > MAX_MSG_LEN)
-          return ws.send(JSON.stringify({ type: "error", data: `Invalid (1-${MAX_MSG_LEN})` }));
-        const users = (await this.state.storage.get("users")) || {};
-        const sender = users[userId], receiver = users[receiverId];
-        if (!sender || !receiver) return ws.send(JSON.stringify({ type: "error", data: "User not found" }));
-        const pm = createPigeonMessage(userId, receiverId, content, sender.lat, sender.lng, receiver.lat, receiver.lng);
-        const messages = (await this.state.storage.get("messages")) || [];
-        messages.push(pm);
-        if (messages.length > 500) messages.splice(0, messages.length - 500);
-        await this.state.storage.put("messages", messages);
-        this.sendTo(userId, { type: "new_message", data: pm });
-        this.sendTo(receiverId, { type: "new_message", data: pm });
-        await this.ensureAlarm();
-        break;
-      }
-
-      case "update_location": {
-        if (!userId) return;
-        const { lat, lng } = msg.data || {};
-        if (typeof lat !== "number" || typeof lng !== "number") return;
-        const users = (await this.state.storage.get("users")) || {};
-        if (users[userId]) { users[userId].lat = lat; users[userId].lng = lng; }
-        await this.state.storage.put("users", users);
-        break;
-      }
-
-      case "ping": ws.send(JSON.stringify({ type: "pong" })); break;
-      default: ws.send(JSON.stringify({ type: "error", data: "Unknown type" }));
+    if (msg.type === "register") {
+      const { userId: uid, name, avatar, lat, lng, city } = msg.data || {};
+      if (!uid || !name) return ws.send(JSON.stringify({ type: "error", data: "userId and name required" }));
+      ws.serializeAttachment({ userId: uid });
+      const users = (await this.state.storage.get("users")) || {};
+      users[uid] = { id: uid, name, avatar: avatar || "🕊️", lat: lat || 0, lng: lng || 0, city: city || "", connected: true };
+      await this.state.storage.put("users", users);
+      const messages = (await this.state.storage.get("messages")) || [];
+      ws.send(JSON.stringify({ type: "welcome", data: { user: users[uid], users: Object.values(users), messages: messages.slice(-50) } }));
+      this.broadcast({ type: "user_online", data: users[uid] }, uid);
+      return;
     }
+
+    if (msg.type === "send_message") {
+      if (!userId) return ws.send(JSON.stringify({ type: "error", data: "Not registered" }));
+      const { receiverId, content } = msg.data || {};
+      if (!receiverId || typeof content !== "string" || !content.length || content.length > MAX_MSG_LEN)
+        return ws.send(JSON.stringify({ type: "error", data: `Invalid (1-${MAX_MSG_LEN})` }));
+      const users = (await this.state.storage.get("users")) || {};
+      const sender = users[userId], receiver = users[receiverId];
+      if (!sender || !receiver) return ws.send(JSON.stringify({ type: "error", data: "User not found" }));
+      const pm = createPigeonMessage(userId, receiverId, content, sender.lat, sender.lng, receiver.lat, receiver.lng);
+      const messages = (await this.state.storage.get("messages")) || [];
+      messages.push(pm);
+      if (messages.length > 500) messages.splice(0, messages.length - 500);
+      await this.state.storage.put("messages", messages);
+      this.sendTo(userId, { type: "new_message", data: pm });
+      this.sendTo(receiverId, { type: "new_message", data: pm });
+      await this.ensureAlarm();
+      return;
+    }
+
+    if (msg.type === "update_location") {
+      if (!userId) return;
+      const { lat, lng } = msg.data || {};
+      if (typeof lat !== "number" || typeof lng !== "number") return;
+      const users = (await this.state.storage.get("users")) || {};
+      if (users[userId]) { users[userId].lat = lat; users[userId].lng = lng; }
+      await this.state.storage.put("users", users);
+      return;
+    }
+
+    if (msg.type === "ping") { ws.send(JSON.stringify({ type: "pong" })); return; }
+    ws.send(JSON.stringify({ type: "error", data: "Unknown type" }));
   }
 
   async webSocketClose(ws) {
