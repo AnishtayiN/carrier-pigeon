@@ -16,4 +16,4 @@ new_classes = ["MessengerDO"]
 [[d1_databases]]
 binding = "DB"
 database_name = "carrier-pigeon-db"
-database_id = "YOUR_D1_ID_HERE"
+database_id = "c93f86de-48cb-4e80-831c-e14182a8e25d"
