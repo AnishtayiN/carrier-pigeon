@@ -1,5 +1,5 @@
-// 🕊️ Carrier Pigeon WebSocket Worker v5.0
-// Cloudflare Workers + Durable Objects (sqlite) + Hibernation API
+// 🕊️ Carrier Pigeon WebSocket Worker v5.1
+// Cloudflare Workers + Durable Objects (SQLite storage) + Hibernation API
 
 const PIGEON_SPEED = 177;
 const LOST_CHANCE = 0.002;
@@ -71,6 +71,7 @@ export class MessengerDO {
 
   async fetch(request) {
     const url = new URL(request.url);
+    await this.initDB();
 
     if (url.pathname === "/ws") {
       if (request.headers.get("Upgrade") !== "websocket") {
@@ -83,20 +84,38 @@ export class MessengerDO {
     }
 
     if (url.pathname === "/messages") {
-      const messages = (await this.state.storage.get("messages")) || [];
-      return Response.json(messages.slice(-100));
+      const msgs = this.state.storage.sql.exec("SELECT * FROM messages ORDER BY sent_at DESC LIMIT 100").toArray();
+      return Response.json(msgs.map(this.dbToMsg));
     }
 
     if (url.pathname === "/users") {
-      const users = (await this.state.storage.get("users")) || {};
-      return Response.json(Object.values(users));
+      const users = this.state.storage.sql.exec("SELECT * FROM users").toArray();
+      return Response.json(users);
     }
 
     return Response.json({
       name: "🕊️ Carrier Pigeon",
-      version: "5.0.0",
+      version: "5.1.0",
       ws: `wss://${url.host}/ws`,
     });
+  }
+
+  async initDB() {
+    this.state.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, avatar TEXT DEFAULT '🕊️',
+        lat REAL DEFAULT 0, lng REAL DEFAULT 0, city TEXT DEFAULT '',
+        connected INTEGER DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS messages (
+        id TEXT PRIMARY KEY, sender_id TEXT NOT NULL, receiver_id TEXT NOT NULL,
+        content TEXT NOT NULL, sent_at INTEGER, last_update_at INTEGER,
+        delivered_at INTEGER, status TEXT DEFAULT 'inTransit',
+        sender_lat REAL, sender_lng REAL, receiver_lat REAL, receiver_lng REAL,
+        current_lat REAL, current_lng REAL, distance_km REAL,
+        speed_kmh REAL, progress REAL DEFAULT 0
+      );
+    `);
   }
 
   async webSocketMessage(ws, raw) {
@@ -113,16 +132,22 @@ export class MessengerDO {
         if (!uid || !name) return ws.send(JSON.stringify({ type: "error", data: "userId and name required" }));
         ws.serializeAttachment({ userId: uid });
 
-        const users = (await this.state.storage.get("users")) || {};
-        users[uid] = { id: uid, name, avatar: avatar || "🕊️", lat: lat || 0, lng: lng || 0, city: city || "", connected: true };
-        await this.state.storage.put("users", users);
+        this.state.storage.sql.exec(
+          "INSERT INTO users (id,name,avatar,lat,lng,city,connected) VALUES (?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET name=excluded.name,avatar=excluded.avatar,lat=excluded.lat,lng=excluded.lng,city=excluded.city,connected=1",
+          uid, name, avatar || "🕊️", lat || 0, lng || 0, city || ""
+        );
 
-        const messages = (await this.state.storage.get("messages")) || [];
+        const users = this.state.storage.sql.exec("SELECT * FROM users").toArray();
+        const user = users.find(u => u.id === uid);
+        const msgs = this.state.storage.sql.exec(
+          "SELECT * FROM messages WHERE sender_id=? OR receiver_id=? ORDER BY sent_at DESC LIMIT 50", uid, uid
+        ).toArray();
+
         ws.send(JSON.stringify({
           type: "welcome",
-          data: { user: users[uid], users: Object.values(users), messages: messages.slice(-50) },
+          data: { user, users, messages: msgs.map(this.dbToMsg).reverse() },
         }));
-        this.broadcast({ type: "user_online", data: users[uid] }, uid);
+        this.broadcast({ type: "user_online", data: user }, uid);
         break;
       }
 
@@ -132,17 +157,18 @@ export class MessengerDO {
         if (!receiverId || typeof content !== "string" || content.length === 0 || content.length > MAX_MSG_LEN)
           return ws.send(JSON.stringify({ type: "error", data: `Invalid (1-${MAX_MSG_LEN} chars)` }));
 
-        const users = (await this.state.storage.get("users")) || {};
-        const sender = users[userId];
-        const receiver = users[receiverId];
+        const sender = this.state.storage.sql.exec("SELECT * FROM users WHERE id=?", userId).toArray()[0];
+        const receiver = this.state.storage.sql.exec("SELECT * FROM users WHERE id=?", receiverId).toArray()[0];
         if (!sender || !receiver) return ws.send(JSON.stringify({ type: "error", data: "User not found" }));
 
         const pm = createPigeonMessage(userId, receiverId, content, sender.lat, sender.lng, receiver.lat, receiver.lng);
 
-        const messages = (await this.state.storage.get("messages")) || [];
-        messages.push(pm);
-        if (messages.length > 500) messages.splice(0, messages.length - 500);
-        await this.state.storage.put("messages", messages);
+        this.state.storage.sql.exec(
+          `INSERT INTO messages (id,sender_id,receiver_id,content,sent_at,last_update_at,delivered_at,status,sender_lat,sender_lng,receiver_lat,receiver_lng,current_lat,current_lng,distance_km,speed_kmh,progress) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          pm.id, pm.senderId, pm.receiverId, pm.content, pm.sentAt, pm.lastUpdateAt, pm.deliveredAt, pm.status,
+          pm.senderLat, pm.senderLng, pm.receiverLat, pm.receiverLng, pm.currentLat, pm.currentLng,
+          pm.distanceKm, pm.speedKmh, pm.progress
+        );
 
         this.sendTo(userId, { type: "new_message", data: pm });
         this.sendTo(receiverId, { type: "new_message", data: pm });
@@ -154,9 +180,7 @@ export class MessengerDO {
         if (!userId) return;
         const { lat, lng } = msg.data || {};
         if (typeof lat !== "number" || typeof lng !== "number") return;
-        const users = (await this.state.storage.get("users")) || {};
-        if (users[userId]) { users[userId].lat = lat; users[userId].lng = lng; }
-        await this.state.storage.put("users", users);
+        this.state.storage.sql.exec("UPDATE users SET lat=?,lng=? WHERE id=?", lat, lng, userId);
         break;
       }
 
@@ -172,12 +196,8 @@ export class MessengerDO {
   async webSocketClose(ws) {
     const att = ws.deserializeAttachment();
     if (!att?.userId) return;
-    const users = (await this.state.storage.get("users")) || {};
-    if (users[att.userId]) {
-      users[att.userId].connected = false;
-      await this.state.storage.put("users", users);
-      this.broadcast({ type: "user_offline", data: { userId: att.userId } });
-    }
+    this.state.storage.sql.exec("UPDATE users SET connected=0 WHERE id=?", att.userId);
+    this.broadcast({ type: "user_offline", data: { userId: att.userId } });
   }
 
   async ensureAlarm() {
@@ -188,17 +208,19 @@ export class MessengerDO {
 
   async alarm() {
     try {
-      const messages = (await this.state.storage.get("messages")) || [];
+      const msgs = this.state.storage.sql.exec("SELECT * FROM messages WHERE status='inTransit'").toArray();
       let hasFlying = false;
-      for (const msg of messages) {
-        if (msg.status === "inTransit") {
-          updatePigeon(msg);
-          hasFlying = true;
-          this.sendTo(msg.senderId, { type: "pigeon_update", data: msg });
-          this.sendTo(msg.receiverId, { type: "pigeon_update", data: msg });
-        }
+      for (const row of msgs) {
+        const msg = this.dbToMsg(row);
+        updatePigeon(msg);
+        hasFlying = true;
+        this.state.storage.sql.exec(
+          "UPDATE messages SET status=?,progress=?,current_lat=?,current_lng=?,last_update_at=?,delivered_at=? WHERE id=?",
+          msg.status, msg.progress, msg.currentLat, msg.currentLng, msg.lastUpdateAt, msg.deliveredAt, msg.id
+        );
+        this.sendTo(msg.senderId, { type: "pigeon_update", data: msg });
+        this.sendTo(msg.receiverId, { type: "pigeon_update", data: msg });
       }
-      await this.state.storage.put("messages", messages);
       if (hasFlying) await this.state.storage.setAlarm(Date.now() + TICK_MS);
     } catch (e) {
       console.error("Alarm error:", e);
@@ -220,6 +242,28 @@ export class MessengerDO {
       if (a?.userId === userId) try { ws.send(data); } catch {}
     }
   }
+
+  dbToMsg(row) {
+    return {
+      id: row.id,
+      senderId: row.sender_id,
+      receiverId: row.receiver_id,
+      content: row.content,
+      sentAt: row.sent_at,
+      lastUpdateAt: row.last_update_at,
+      deliveredAt: row.delivered_at,
+      status: row.status,
+      senderLat: row.sender_lat,
+      senderLng: row.sender_lng,
+      receiverLat: row.receiver_lat,
+      receiverLng: row.receiver_lng,
+      currentLat: row.current_lat,
+      currentLng: row.current_lng,
+      distanceKm: row.distance_km,
+      speedKmh: row.speed_kmh,
+      progress: row.progress,
+    };
+  }
 }
 
 export default {
@@ -233,7 +277,7 @@ export default {
       }});
     }
     if (url.pathname === "/") {
-      return Response.json({ name: "🕊️ Carrier Pigeon", version: "5.0.0", ws: `wss://${url.host}/ws` });
+      return Response.json({ name: "🕊️ Carrier Pigeon", version: "5.1.0", ws: `wss://${url.host}/ws` });
     }
     const doId = env.MESSENGER.idFromName("main");
     return env.MESSENGER.get(doId).fetch(request);
